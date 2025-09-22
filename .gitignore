@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+downloads/
+.pw-user/
+roots.txt
+state.json
