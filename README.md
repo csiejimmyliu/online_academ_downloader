@@ -5,12 +5,10 @@
 ## Setup
 
 ```bash
-chmod +x setup.sh
-./setup.sh
-# or:
-# pip install -r requirements.txt
-# playwright install chromium
+bash ./setup.sh
+source venv/bin/activate
 ```
+
 
 ## Login
 
@@ -24,7 +22,7 @@ python downloader.py --login --seed "https://online-academy.fishhuang.com/learni
 ### A) Auto-discover pages and download
 
 ```bash
-python downloader.py --discover "https://online-academy.fishhuang.com/learning/megacombo" --out downloads --max-roots 500
+python downloader.py --discover "https://online-academy.fishhuang.com/learning/megacombo" --out downloads
 ```
 
 ### B) From a list (one URL per line in roots.txt)

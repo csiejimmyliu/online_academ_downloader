@@ -12,7 +12,7 @@ else
 fi
 
 # --- Create venv ---
-VENV_DIR=".venv"
+VENV_DIR="venv"
 if [ ! -d "$VENV_DIR" ]; then
   echo "Creating virtual environment at $VENV_DIR ..."
   "$PY" -m venv "$VENV_DIR"

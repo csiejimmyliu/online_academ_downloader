@@ -32,17 +32,31 @@ def scroll(page, times=6, px=1400):
         page.mouse.wheel(0, px)
         page.wait_for_timeout(350)
 
+def safe_goto(page, url, attempts=3):
+    """Navigate with retries; handles transient net errors (e.g., ERR_NETWORK_IO_SUSPENDED)."""
+    for i in range(1, attempts + 1):
+        try:
+            return page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            msg = str(e)
+            if "ERR_NETWORK_IO_SUSPENDED" in msg or "net::ERR" in msg:
+                print(f"  ! network error on goto (attempt {i}/{attempts}): {msg}")
+                page.wait_for_timeout(1500 * i)  # simple backoff
+                continue
+            raise
+    print("  ! giving up on this page due to repeated navigation errors")
+    return None
+
 def discover_megacombos(ctx, seeds, max_pages=80):
-    """Breadth-first discovery of all megacombo root pages (single level)."""
+    """(Collect-first) Breadth-first discovery of all megacombo root pages (single level)."""
     found = set(); visited = set(); dq = collections.deque(seeds)
     while dq and len(visited) < max_pages:
         url = dq.popleft()
         if url in visited: continue
         visited.add(url)
         page = ctx.new_page(); page.set_default_timeout(15000)
-        try:
-            page.goto(url)
-        except PWTimeoutError:
+        resp = safe_goto(page, url, attempts=3)
+        if not resp:
             page.close(); continue
         scroll(page, 4)
         for u in abs_links(page):
@@ -54,6 +68,63 @@ def discover_megacombos(ctx, seeds, max_pages=80):
                 dq.append(u)
         page.close()
     return sorted(found)
+
+def stream_discover_and_download(ctx, seeds, out_dir, save_roots=None, max_pages=100, max_roots=500):
+    """
+    Streaming BFS: as soon as a megacombo root is discovered, download it immediately.
+    Optionally append each found root to save_roots.
+    """
+    visited_pages = set()
+    found_roots = set()
+    dq = collections.deque(seeds)
+
+    total_downloaded = 0
+    pages_seen = 0
+
+    while dq and pages_seen < max_pages and len(found_roots) < max_roots:
+        url = dq.popleft()
+        if url in visited_pages:
+            continue
+        visited_pages.add(url)
+
+        page = ctx.new_page()
+        page.set_default_timeout(15000)
+        resp = safe_goto(page, url, attempts=3)
+        if not resp:
+            page.close()
+            continue
+
+        scroll(page, 4)
+
+        for u in abs_links(page):
+            if not same_site(u, url):
+                continue
+            p = urlparse(u)
+
+            # If it's a megacombo root and not processed, process NOW
+            if MEGACOMBO_RE.search(p.path):
+                if u not in found_roots:
+                    found_roots.add(u)
+                    if save_roots:
+                        with open(save_roots, "a") as f:
+                            f.write(u + "\n")
+                    print(f"\n[discover] found root: {u}")
+                    try:
+                        total_downloaded += run_one_level(ctx, u, out_dir)
+                    except Exception as e:
+                        print(f"!! skipped due to error on {u}: {e}")
+
+                    if len(found_roots) >= max_roots:
+                        break
+
+            # Keep BFS shallow
+            elif p.path.count("/") <= 5 and not PDF_RE.search(u):
+                dq.append(u)
+
+        pages_seen += 1
+        page.close()
+
+    return total_downloaded, len(found_roots), pages_seen
 
 def try_expand(page):
     # Try to expand course/catalog sections so all "Download" buttons are visible
@@ -134,10 +205,11 @@ def run_one_level(ctx, url, out_dir):
     ensure_dir(save_dir)
 
     print(f"\n=== Page: {url}")
-    try:
-        page.goto(url)
-    except PWTimeoutError:
-        print("  ⚠️ Load timeout, skipping"); page.close(); return 0
+    resp = safe_goto(page, url, attempts=4)
+    if not resp:
+        print("  ⚠️ Could not open page after retries, skipping")
+        page.close()
+        return 0
 
     scroll(page, 8)
     try_expand(page)
@@ -153,10 +225,10 @@ def main():
     ap = argparse.ArgumentParser(description="One-level batch downloader for megacombo pages.")
     ap.add_argument("--login", action="store_true", help="Login first and persist cookies (login only; no other actions).")
     ap.add_argument("--seed", help="Page to open during login (optional; defaults to site homepage).")
-    ap.add_argument("--discover", nargs="*", help="Seed pages to auto-discover megacombo roots (one or more).")
+    ap.add_argument("--discover", nargs="*", help="Seed pages to auto-discover megacombo roots (streaming: download immediately).")
     ap.add_argument("--roots-file", help="File containing megacombo URLs (one per line).")
     ap.add_argument("--out", default="downloads", help="Output directory.")
-    ap.add_argument("--save-roots", help="Write discovered roots to this file.")
+    ap.add_argument("--save-roots", help="Path to append discovered roots (optional).")
     ap.add_argument("--max-roots", type=int, default=500, help="Max number of roots to process.")
     ap.add_argument("--headless", action="store_true", help="Headless mode (for download phase).")
     args = ap.parse_args()
@@ -164,11 +236,9 @@ def main():
     ensure_dir(args.out)
     state_file = "state.json"
 
-    from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         # ========== A) Login mode: only handles login, then exits ==========
         if args.login:
-            # Use a persistent context so login data is written to disk
             ctx = p.chromium.launch_persistent_context(
                 user_data_dir=".pw-user",
                 headless=False,
@@ -177,10 +247,8 @@ def main():
             page.goto(args.seed or "https://online-academy.fishhuang.com/")
             print("Please complete login in the opened browser. Once the page is accessible, return here and press Enter to continue…")
             input()
-            # Save login state
             ctx.storage_state(path=state_file)
             print("✅ Saved login state to state.json")
-            # Close and exit (no discover/download in login mode)
             ctx.close()
             return
 
@@ -197,34 +265,42 @@ def main():
         )
 
         # Roots source: either --roots-file or --discover (one is required)
-        roots = []
         if args.roots_file:
             with open(args.roots_file) as f:
                 roots = [line.strip() for line in f if line.strip()]
+            if not roots:
+                print("⚠️ No megacombo pages found in roots file.")
+                ctx.close(); browser.close(); return
+            roots = roots[: args.max_roots]
+            print(f"✅ Preparing to process {len(roots)} page(s)")
+            total = 0
+            for r in roots:
+                try:
+                    total += run_one_level(ctx, r, args.out)
+                except Exception as e:
+                    print(f"!! skipped due to error on {r}: {e}")
+            ctx.close(); browser.close()
+            print(f"\n🎉 Done! Total files downloaded: {total}; Output directory: {os.path.abspath(args.out)}")
+            return
+
         elif args.discover:
-            print(f"🔎 Discovering megacombo pages from {len(args.discover)} seed(s)…")
-            roots = discover_megacombos(ctx, args.discover, max_pages=100)
-            if args.save_roots:
-                with open(args.save_roots, "w") as f:
-                    f.write("\n".join(roots) + "\n")
-                print(f"📝 Roots written to: {os.path.abspath(args.save_roots)}")
+            print(f"🔎 Streaming discover & download from {len(args.discover)} seed(s)…")
+            total, num_roots, pages_seen = stream_discover_and_download(
+                ctx,
+                seeds=args.discover,
+                out_dir=args.out,
+                save_roots=args.save_roots,
+                max_pages=100,
+                max_roots=args.max_roots,
+            )
+            ctx.close(); browser.close()
+            print(f"\n✅ Discovered {num_roots} roots across {pages_seen} page(s)")
+            print(f"🎉 Done! Total files downloaded during discovery: {total}; Output directory: {os.path.abspath(args.out)}")
+            return
+
         else:
             print("❌ Please provide --roots-file or --discover (one is required in download mode).")
             ctx.close(); browser.close(); return
-
-        if not roots:
-            print("⚠️ No megacombo pages found.")
-            ctx.close(); browser.close(); return
-
-        roots = roots[: args.max_roots]
-        print(f"✅ Preparing to process {len(roots)} page(s)")
-
-        total = 0
-        for r in roots:
-            total += run_one_level(ctx, r, args.out)
-
-        ctx.close(); browser.close()
-        print(f"\n🎉 Done! Total files downloaded: {total}; Output directory: {os.path.abspath(args.out)}")
 
 
 if __name__ == "__main__":
